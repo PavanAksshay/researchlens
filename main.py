@@ -3,7 +3,7 @@ import uuid
 import tempfile
 from pathlib import Path
 from typing import Annotated, TypedDict, cast
-
+from supabase import create_client, Client
 import fitz
 from docx import Document as DocxDocument
 from google import genai
