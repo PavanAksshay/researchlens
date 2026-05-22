@@ -4,13 +4,14 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, TypedDict, cast
 from supabase import create_client, Client
+
 import fitz
 from docx import Document as DocxDocument
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from pptx.api import Presentation
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
@@ -27,11 +28,22 @@ from qdrant_client.models import (
 
 _ = load_dotenv()
 
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 QDRANT_URL       = os.getenv("QDRANT_URL")
 QDRANT_API_KEY   = os.getenv("QDRANT_API_KEY")
+SUPABASE_URL = _require_env("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = _require_env("SUPABASE_SERVICE_KEY")
+supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 COLLECTION_NAME  = os.getenv("COLLECTION_NAME", "researchlens")
 CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP", "50"))
@@ -96,6 +108,21 @@ def _require_payload(payload: object | None) -> ChunkPayload:
     return cast(ChunkPayload, cast(object, payload))
 
 
+def _supabase_rows(data: object | None) -> list[dict[str, object]]:
+    if not isinstance(data, list):
+        return []
+    rows: list[dict[str, object]] = []
+    for item in data:
+        if isinstance(item, dict):
+            rows.append(cast(dict[str, object], cast(object, item)))
+    return rows
+
+
+def _row_str(row: dict[str, object], key: str, default: str = "") -> str:
+    value = row.get(key)
+    return str(value) if value is not None else default
+
+
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     """Split text into overlapping word-based chunks."""
     words = text.split()
@@ -139,7 +166,9 @@ def extract_pptx(path: str) -> list[PageText]:
 def extract_docx(path: str) -> list[PageText]:
     """Return list of {page, text} dicts from a DOCX file."""
     doc = DocxDocument(path)
-    chunks, current, page = [], [], 1
+    chunks: list[PageText] = []
+    current: list[str] = []
+    page = 1
     for para in doc.paragraphs:
         text = para.text.strip()
         if not text:
@@ -188,6 +217,27 @@ class Citation(BaseModel):
     score: float
 
 
+def _parse_citations(value: object) -> list[Citation]:
+    if not isinstance(value, list):
+        return []
+    citations: list[Citation] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        raw = cast(dict[str, object], cast(object, item))
+        page_val = raw.get("page")
+        score_val = raw.get("score")
+        citations.append(
+            Citation(
+                source=_row_str(raw, "source"),
+                page=page_val if isinstance(page_val, int) else None,
+                snippet=_row_str(raw, "snippet"),
+                score=float(score_val) if isinstance(score_val, (int, float)) else 0.0,
+            )
+        )
+    return citations
+
+
 class QueryRequest(BaseModel):
     document_id: str | None = None   # filter to one doc, or None = search all
     question: str
@@ -198,6 +248,31 @@ class QueryResponse(BaseModel):
     citations: list[Citation]
     confidence: str   # "high" | "medium" | "low"
 
+class ChatHistoryItem(BaseModel):
+    id: str
+    document_id: str
+    filename: str
+    question: str
+    answer: str
+    citations: list[Citation]
+    confidence: str
+    created_at: str
+
+class DocumentRecord(BaseModel):
+    id: str
+    user_id: str
+    document_id: str
+    filename: str
+    chunks_indexed: int
+    created_at: str
+
+
+class UserDocumentsResponse(BaseModel):
+    documents: list[DocumentRecord]
+
+class ChatHistoryResponse(BaseModel):
+    history: list[ChatHistoryItem]
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -206,7 +281,7 @@ def health():
 
 
 @app.post("/ingest", response_model=IngestResponse)
-async def ingest(file: Annotated[UploadFile, File()]):
+async def ingest(request: Request, file: Annotated[UploadFile, File()]):
     """
     Accept a PDF or PPTX file, extract text, chunk it,
     embed with Gemini, and store in Qdrant.
@@ -276,6 +351,16 @@ async def ingest(file: Annotated[UploadFile, File()]):
     ]
     _ = qdrant.upsert(collection_name=COLLECTION_NAME, points=cast(Points, points))
 
+    # Save to Supabase if user_id provided
+    user_id = request.headers.get("X-User-Id")
+    if user_id:
+        supabase_client.table("documents").insert({
+            "user_id": user_id,
+            "document_id": document_id,
+            "filename": filename,
+            "chunks_indexed": len(points),
+        }).execute()
+
     return IngestResponse(
         document_id=document_id,
         filename=filename,
@@ -284,7 +369,7 @@ async def ingest(file: Annotated[UploadFile, File()]):
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
+async def query(request: Request, req: QueryRequest):
     """
     Embed the question, retrieve top-K chunks from Qdrant,
     and ask Gemini to answer with citations.
@@ -363,6 +448,19 @@ Answer (with inline citations):"""
     # Confidence based on top hit score
     top_score = hits[0].score if hits else 0
     confidence = "high" if top_score > 0.82 else "medium" if top_score > 0.65 else "low"
+    
+    # Save to chat history if user_id provided
+    user_id = request.headers.get("X-User-Id")
+    if user_id:
+        supabase_client.table("chat_history").insert({
+            "user_id": user_id,
+            "document_id": req.document_id or "all",
+            "filename": _require_payload(hits[0].payload)["filename"] if hits else "unknown",
+            "question": req.question,
+            "answer": answer_text,
+            "citations": [c.model_dump() for c in citations],
+            "confidence": confidence,
+        }).execute()
 
     return QueryResponse(
         answer=answer_text,
@@ -381,3 +479,68 @@ def delete_document(document_id: str):
         ),
     )
     return {"deleted": document_id}
+
+
+@app.get("/history/{user_id}", response_model=ChatHistoryResponse)
+def get_chat_history(user_id: str, document_id: str | None = None):
+    """Get chat history for a user, optionally filtered by document."""
+    query = supabase_client.table("chat_history")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .limit(50)
+    
+    if document_id:
+        query = query.eq("document_id", document_id)
+    
+    result = query.execute()
+    history: list[ChatHistoryItem] = []
+    for row in _supabase_rows(result.data):
+        history.append(
+            ChatHistoryItem(
+                id=_row_str(row, "id"),
+                document_id=_row_str(row, "document_id"),
+                filename=_row_str(row, "filename"),
+                question=_row_str(row, "question"),
+                answer=_row_str(row, "answer"),
+                citations=_parse_citations(row.get("citations")),
+                confidence=_row_str(row, "confidence"),
+                created_at=_row_str(row, "created_at"),
+            )
+        )
+    return ChatHistoryResponse(history=history)
+
+
+@app.get("/documents/{user_id}", response_model=UserDocumentsResponse)
+def get_user_documents(user_id: str):
+    """Get all documents uploaded by a user."""
+    result = supabase_client.table("documents")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .execute()
+    documents: list[DocumentRecord] = []
+    for row in _supabase_rows(result.data):
+        chunks_val = row.get("chunks_indexed")
+        documents.append(
+            DocumentRecord(
+                id=_row_str(row, "id"),
+                user_id=_row_str(row, "user_id"),
+                document_id=_row_str(row, "document_id"),
+                filename=_row_str(row, "filename"),
+                chunks_indexed=int(chunks_val) if isinstance(chunks_val, int) else 0,
+                created_at=_row_str(row, "created_at"),
+            )
+        )
+    return UserDocumentsResponse(documents=documents)
+
+
+@app.delete("/history/{user_id}/{history_id}")
+def delete_history_item(user_id: str, history_id: str):
+    """Delete a specific chat history item."""
+    supabase_client.table("chat_history")\
+        .delete()\
+        .eq("id", history_id)\
+        .eq("user_id", user_id)\
+        .execute()
+    return {"deleted": history_id} 
