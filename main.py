@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated, TypedDict, cast
 
 import fitz
+from docx import Document as DocxDocument
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -135,6 +136,24 @@ def extract_pptx(path: str) -> list[PageText]:
             slides.append({"page": i, "text": " ".join(texts)})
     return slides
 
+def extract_docx(path: str) -> list[PageText]:
+    """Return list of {page, text} dicts from a DOCX file."""
+    doc = DocxDocument(path)
+    chunks, current, page = [], [], 1
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        current.append(text)
+        # Treat every 10 paragraphs as a "page" for citation purposes
+        if len(current) >= 10:
+            chunks.append({"page": page, "text": " ".join(current)})
+            page += 1
+            current = []
+    if current:
+        chunks.append({"page": page, "text": " ".join(current)})
+    return chunks
+
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     embeddings = []
@@ -197,7 +216,7 @@ async def ingest(file: Annotated[UploadFile, File()]):
 
     filename = file.filename
     suffix = Path(filename).suffix.lower()
-    if suffix not in {".pdf", ".pptx", ".ppt"}:
+    if suffix not in {".pdf", ".pptx", ".ppt", ".docx"}:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported file type '{suffix}'. Upload PDF or PPTX.",
@@ -210,7 +229,12 @@ async def ingest(file: Annotated[UploadFile, File()]):
         tmp_path = tmp.name
 
     try:
-        pages = extract_pdf(tmp_path) if suffix == ".pdf" else extract_pptx(tmp_path)
+        if suffix == ".pdf":
+            pages = extract_pdf(tmp_path)
+        elif suffix == ".docx":
+            pages = extract_docx(tmp_path)
+        else:
+            pages = extract_pptx(tmp_path)
     finally:
         os.unlink(tmp_path)
 
