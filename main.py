@@ -45,12 +45,12 @@ SUPABASE_URL = _require_env("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = _require_env("SUPABASE_SERVICE_KEY")
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 COLLECTION_NAME  = os.getenv("COLLECTION_NAME", "researchlens")
-CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE", "600"))
 CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP", "50"))
-TOP_K            = int(os.getenv("TOP_K_RESULTS", "5"))
-EMBED_MODEL      = "gemini-embedding-001"
+TOP_K            = int(os.getenv("TOP_K_RESULTS", "8"))
+EMBED_MODEL      = "gemini-embedding-2"
 EMBED_DIM        = 3072  # fixed output dim for text-embedding-004
-CHAT_MODEL = "gemini-2.5-flash"
+CHAT_MODEL = "gemini-2.5-pro"
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
